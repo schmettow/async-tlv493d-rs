@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 
 use bitflags::bitflags;
 use embedded_hal::delay::blocking::DelayMs;
-use embedded_hal::i2c::{blocking as i2c};
+use embedded_hal::i2c::blocking as i2c;
 use log::debug;
 
 #[cfg(feature = "std")]
@@ -135,7 +135,7 @@ where
         debug!("New Tlv493d with address: 0x{:02x}", addr);
 
         // Construct object
-        let mut s = Self {
+        Ok(Self {
             i2c,
             _delay: delay,
             addr,
@@ -143,13 +143,7 @@ where
             last_frm: 0xff,
             _e_i2c: PhantomData,
             _e_delay: PhantomData,
-        };
-
-        // Reset and configure
-        s.configure(mode, true)?;
-
-        // Return object
-        Ok(s)
+        })
     }
 
     /// Configure the device into the specified mode
@@ -234,9 +228,7 @@ where
 
         // Read data from device
         let mut b = [0u8; 7];
-        self.i2c
-            .read(self.addr, &mut b[..])
-            .map_err(Error::I2c)?;
+        self.i2c.read(self.addr, &mut b[..]).map_err(Error::I2c)?;
 
         // Detect ADC lockup (stalled FRM field)
         let frm = b[3] & 0b0000_1100;
