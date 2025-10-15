@@ -1,6 +1,6 @@
 #![no_std]
 
-/// Rust tlv493d 3-DoF I2C Hall Effect Sensor Driver
+/// Rust tlv493d 3-DoF I2C Hall Effect Sensor Driver (Async Version)
 ///
 /// Copyright 2020 Ryan Kurte
 ///
@@ -10,21 +10,19 @@ use core::fmt::Debug;
 use core::marker::PhantomData;
 
 use bitflags::bitflags;
-use embedded_hal::delay::blocking::DelayMs;
-use embedded_hal::i2c::blocking as i2c;
 use log::debug;
 
-#[cfg(feature = "std")]
-extern crate std;
+// Embassy async imports
+use embassy_time::{Duration, Timer};
+use embedded_hal_async::i2c::I2c as AsyncI2c;
 
-pub struct Tlv493d<I2c, I2cErr, Delay, DelayErr> {
+/// Async TLV493D sensor driver for Embassy framework
+pub struct Tlv493d<I2c, I2cErr> {
     i2c: I2c,
-    _delay: Delay,
     addr: u8,
     initial: [u8; 10],
     last_frm: u8,
     _e_i2c: PhantomData<I2cErr>,
-    _e_delay: PhantomData<DelayErr>,
 }
 
 /// Base address for Tlv493d, bottom bit set during power up
@@ -57,10 +55,10 @@ pub enum WriteRegisters {
 /// TLV493D Measurement values
 #[derive(Debug, PartialEq, Clone)]
 pub struct Values {
-    x: f32,    // X axis magnetic flux (mT)
-    y: f32,    // Y axis magnetic flux (mT)
-    z: f32,    // Z axis magnetic flux (mT)
-    temp: f32, // Device temperature (C)
+    pub x: f32,    // X axis magnetic flux (mT)
+    pub y: f32,    // Y axis magnetic flux (mT)
+    pub z: f32,    // Z axis magnetic flux (mT)
+    pub temp: f32, // Device temperature (C)
 }
 
 /// Device operating mode
@@ -96,58 +94,42 @@ bitflags! {
 
 /// Tlv493d related errors
 #[derive(Debug)]
-#[cfg_attr(feature = "std", derive(thiserror::Error))]
-pub enum Error<I2cErr: Debug, DelayErr: Debug> {
+pub enum Error<I2cErr: Debug> {
     // No device found with specified i2c bus and address
-    #[cfg_attr(
-        feature = "std",
-        error("No device found with specified i2c bus and address")
-    )]
     NoDevice,
-
     // Device ADC locked up and must be reset
-    #[cfg_attr(feature = "std", error("Device ADC lockup, reset required"))]
     AdcLockup,
-
     // Underlying I2C device error
-    #[cfg_attr(feature = "std", error("I2C device error: {0:?}"))]
     I2c(I2cErr),
-
-    // Underlying delay driver error
-    #[cfg_attr(feature = "std", error("Delay error: {0:?}"))]
-    Delay(DelayErr),
 }
 
-impl<I2c, I2cErr, Delay, DelayErr> Tlv493d<I2c, I2cErr, Delay, DelayErr>
+impl<I2c, I2cErr> Tlv493d<I2c, I2cErr>
 where
-    I2c: i2c::Read<Error = I2cErr> + i2c::Write<Error = I2cErr> + i2c::WriteRead<Error = I2cErr>,
+    I2c: AsyncI2c<Error = I2cErr>,
     I2cErr: Debug,
-    Delay: DelayMs<u32, Error = DelayErr>,
-    DelayErr: Debug,
 {
-    /// Create a new TLV493D instance
-    pub fn new(
-        i2c: I2c,
-        delay: Delay,
-        addr: u8,
-        mode: Mode,
-    ) -> Result<Self, Error<I2cErr, DelayErr>> {
-        debug!("New Tlv493d with address: 0x{:02x}", addr);
+    /// Create a new async TLV493D instance
+    pub async fn new_async(i2c: I2c, addr: u8, mode: Mode) -> Result<Self, Error<I2cErr>> {
+        debug!("New async Tlv493d with address: 0x{:02x}", addr);
 
         // Construct object
-        Ok(Self {
+        let mut s = Self {
             i2c,
-            _delay: delay,
             addr,
             initial: [0u8; 10],
             last_frm: 0xff,
             _e_i2c: PhantomData,
-            _e_delay: PhantomData,
-        })
+        };
+
+        // Reset and configure
+        s.configure(mode, true).await?;
+
+        // Return object
+        Ok(s)
     }
 
     /// Configure the device into the specified mode
-    pub fn configure(&mut self, mode: Mode, reset: bool) -> Result<(), Error<I2cErr, DelayErr>> {
+    pub async fn configure(&mut self, mode: Mode, reset: bool) -> Result<(), Error<I2cErr>> {
         // Startup per fig. 5.1 in TLV493D-A1B6 user manual
 
         // Reset if enabled
@@ -155,22 +137,25 @@ where
             debug!("Resetting device");
 
             // Write recovery value
-            self.i2c.write(self.addr, &[0xFF]).map_err(Error::I2c)?;
+            self.i2c
+                .write(self.addr, &[0xFF])
+                .await
+                .map_err(Error::I2c)?;
 
-            // Wait for startup delay
-            self._delay.delay_ms(40).map_err(Error::Delay)?;
+            // Wait for startup delay using Embassy timer
+            Timer::after(Duration::from_millis(40)).await;
 
             debug!("Setting device address");
 
             // TODO: work out why things get upset if we set the address
-            //self.i2c.write(0x00, &[0xFF]).map_err(Error::I2c)?;
+            //self.i2c.write(0x00, &[0xFF]).await.map_err(Error::I2c)?;
 
             debug!("Read device initial state");
 
             // Read initial bitmap from device
-            let _ = self
-                .i2c
+            self.i2c
                 .read(self.addr, &mut self.initial[..])
+                .await
                 .map_err(Error::I2c)?;
 
             debug!("Initial state: {:02x?}", self.initial);
@@ -217,18 +202,21 @@ where
             m1, m2, cfg
         );
 
-        self.i2c.write(self.addr, &cfg).map_err(Error::I2c)?;
+        self.i2c.write(self.addr, &cfg).await.map_err(Error::I2c)?;
 
         Ok(())
     }
 
     /// Read raw values from the sensor
-    pub fn read_raw(&mut self) -> Result<[i16; 4], Error<I2cErr, DelayErr>> {
+    pub async fn read_raw_async(&mut self) -> Result<[i16; 4], Error<I2cErr>> {
         let mut v = [0i16; 4];
 
         // Read data from device
         let mut b = [0u8; 7];
-        self.i2c.read(self.addr, &mut b[..]).map_err(Error::I2c)?;
+        self.i2c
+            .read(self.addr, &mut b[..])
+            .await
+            .map_err(Error::I2c)?;
 
         // Detect ADC lockup (stalled FRM field)
         let frm = b[3] & 0b0000_1100;
@@ -251,8 +239,8 @@ where
     }
 
     /// Read and convert values from the sensor
-    pub fn read(&mut self) -> Result<Values, Error<I2cErr, DelayErr>> {
-        let raw = self.read_raw()?;
+    pub async fn read(&mut self) -> Result<Values, Error<I2cErr>> {
+        let raw = self.read_raw_async().await?;
 
         Ok(Values {
             x: raw[0] as f32 * 0.098f32,
@@ -260,14 +248,5 @@ where
             z: raw[2] as f32 * 0.098f32,
             temp: (raw[3] - 340) as f32 * 1.1f32 + 24.2f32,
         })
-    }
-
-    #[cfg(feature = "math")]
-    pub fn read_angle_f32(&mut self) -> Result<f32, Error<I2cErr, DelayErr>> {
-        // Read values
-        let v = self.read()?;
-
-        // https://en.wikipedia.org/wiki/Atan2
-        Ok(v.x.atan2(v.y))
     }
 }
